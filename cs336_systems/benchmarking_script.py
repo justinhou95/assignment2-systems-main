@@ -18,7 +18,9 @@ def parse_args():
         choices=["small", "medium", "large", "xl", "2.7B"],
     )
     parser.add_argument(
-        "--mode", choices=["forward", "forward_backward"], default="forward_backward"
+        "--mode",
+        choices=["forward", "forward_backward", "forward_backward_optimizer"],
+        default="forward_backward",
     )
     parser.add_argument("--warmup-steps", type=int, default=5)
     parser.add_argument("--steps", type=int, default=10)
@@ -28,6 +30,10 @@ def parse_args():
     parser.add_argument(
         "--mixed-precision", action="store_true", help="Use BF16 mixed precision"
     )
+    parser.add_argument(
+        "--profile-memory", action="store_true", help="Record CUDA memory snapshot"
+    )
+    parser.add_argument("--context-length", type=int, default=128)
     return parser.parse_args()
 
 
@@ -43,7 +49,7 @@ MODEL_CONFIGS = {
 def benchmark(args):
     vocab_size = 10000
     batch_size = 4
-    context_length = 128
+    context_length = args.context_length
     rope_theta = 10000
     cfg = MODEL_CONFIGS[args.size]
     d_model, d_ff, num_layers, num_heads = (
@@ -57,6 +63,7 @@ def benchmark(args):
     )
     model = model.to(args.device)
     model.train()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
 
     # Move inputs to device once, not on every step
     x0 = torch.randint(
@@ -76,13 +83,15 @@ def benchmark(args):
     def run_step():
         with amp_ctx:
             logits = model(x0)
-            if args.mode == "forward_backward":
+            if args.mode in ("forward_backward", "forward_backward_optimizer"):
                 loss = cross_entropy(
                     rearrange(logits, "b s v -> (b s) v"), rearrange(y0, "b s -> (b s)")
                 )
-        if args.mode == "forward_backward":
+        if args.mode in ("forward_backward", "forward_backward_optimizer"):
             loss.backward()
-            model.zero_grad(set_to_none=True)
+        if args.mode == "forward_backward_optimizer":
+            optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
 
     # Warm-up
     print("Running warm-up steps...")
@@ -91,26 +100,46 @@ def benchmark(args):
         if "cuda" in args.device:
             torch.cuda.synchronize()
 
+    is_cuda = "cuda" in args.device
+
+    if is_cuda:
+        torch.cuda.reset_peak_memory_stats()
+
+    if args.profile_memory and is_cuda:
+        torch.cuda.memory._record_memory_history(max_entries=1000000)
+
     # Timed steps
     print("Running timed steps...")
     times = []
     for _ in range(args.steps):
-        if "cuda" in args.device:
+        if is_cuda:
             torch.cuda.synchronize()
         t0 = timeit.default_timer()
         run_step()
-        if "cuda" in args.device:
+        if is_cuda:
             torch.cuda.synchronize()
         t1 = timeit.default_timer()
         times.append(t1 - t0)
+
+    if args.profile_memory and is_cuda:
+        snapshot_file = (
+            f"memory_snapshot_{args.size}_ctx{args.context_length}_{args.mode}.pickle"
+        )
+        torch.cuda.memory._dump_snapshot(snapshot_file)
+        torch.cuda.memory._record_memory_history(enabled=None)
+        print(f"Memory snapshot saved to {snapshot_file}")
 
     times_ms = [t * 1000 for t in times]
     mean = sum(times_ms) / len(times_ms)
     std = (sum((t - mean) ** 2 for t in times_ms) / len(times_ms)) ** 0.5
     print(f"Results ({args.steps} steps, mode={args.mode}):")
     print(
-        f" Mean: {mean:.2f} ms  Std: {std:.2f} ms  Min: {min(times_ms):.2f} ms  Max: {max(times_ms):.2f} ms"
+        f"  Mean: {mean:.2f} ms  Std: {std:.2f} ms  Min: {min(times_ms):.2f} ms  Max: {max(times_ms):.2f} ms"
     )
+
+    if is_cuda:
+        peak_mb = torch.cuda.max_memory_allocated() / 1024**2
+        print(f"  Peak memory: {peak_mb:.1f} MB ({peak_mb / 1024:.2f} GB)")
 
 
 if __name__ == "__main__":
